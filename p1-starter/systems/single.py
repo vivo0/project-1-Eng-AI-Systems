@@ -1,102 +1,264 @@
 """The single-call variant: one model call per request, no steps.
 
-Write your instructions for the model in INSTRUCTIONS. Keep it to one call: the starter code refuses a second
-call and the request fails.
+The model does only what needs language: it reads the request into structured requirements, and it reads each
+game's description (features such as fighting or horror, wording about how easy the rules are, and numbers the
+card doesn't list). Plain Python then checks every requirement against the cards, following RUBRIC.md, and picks.
+Still one model call per request.
 """
-from p1 import Answer, Request, call_json
+from typing import Literal, Optional, Union
+
+from pydantic import BaseModel, ValidationError
+
+from p1 import Answer, Request, call, parse_json
 from p1.render import render_request
+from p1.types import Candidate
 
 VARIANT = "single"
 
+FEATURES = ("fighting", "violence", "horror", "timer", "elimination")
+
 # Your instructions: what the model should do with the request and the five games.
-INSTRUCTIONS = """You recommend board games. Below is a person's request and five candidate games (A to E). Each game has a \
-fact card and BoardGameGeek's description. Pick ONE game that surely meets every requirement in the request, or \
-decline (pick null) if no game does. Use only the card and the description: ignore anything you know about the \
-game from elsewhere.
+INSTRUCTIONS = """You help recommend board games. You get a person's request and five candidate games (A to E), each \
+with a fact card and a description. You do NOT pick a game. You do two jobs, and code does the rest.
 
-STEP 1: List the requirements.
-- Only hard requirements count. Wishes ("would be nice", "would be amazing", "we'd love", "something like X") \
-are NOT requirements: ignore them.
-- Players: count everyone who plays, including the writer when they say "I", "we", "us" or "me". \
-"Me and my brother" = 2. "Me, my husband and our three kids" = 5. "Game night with six friends" = 7.
-- Play time: turn phrases into a maximum in minutes. "An hour", "an hour tops", "about an hour" = at most 60. \
-"Half an hour" = at most 30.
-- Complexity: "easy rules", "simple", "beginners", "never play board games", "casual players" = LIGHT. \
-"Deep strategy", "meaty", "nothing light" = HEAVY. "Not too simple, not too heavy" = MEDIUM.
-- Cooperative: "together against the game", "team up against the game", "as one team". \
-Competitive: "head to head", "against each other". If the request says nothing, there is no requirement.
-- Age: "our 8-year-old" means the minimum age must be 8 or lower.
-- Things to avoid: "no fighting"/"no combat" = no FIGHTING. "Nothing violent" = no VIOLENCE (which also rules out \
-fighting). "Nothing scary"/"nothing creepy" = no HORROR. "No timers"/"no racing against the clock" = no TIMER. \
-"Nobody knocked out"/"nobody sitting out" = no PLAYER ELIMINATION.
+JOB 1: Read the request into requirements. Only write down what the request actually asks for. Never invent a \
+requirement: if the request doesn't mention play time, max_minutes is null, and so on.
+Wishes are not requirements: ignore everything after "would be nice", "would be amazing", "we'd love", "it would be \
+great", and "something like X".
+- players: count everyone who plays, including the writer when they say "I", "we", "us" or "me". "Me and my brother" \
+= 2. "My wife and I" = 2. "My friend and I" = 2. "Me and my three friends" = 4. "Six of us" = 6. "Me, my husband and \
+our three kids" = 5. "Game night with six friends" = 7.
+- max_minutes: "an hour", "an hour tops", "about an hour" = 60. "Half an hour" = 30. "No more than 90 minutes" = 90. \
+"Two hours at most" = 120.
+- complexity: "easy rules", "simple", "beginners", "never play board games", "casual players" = "light". "Deep \
+strategy", "meaty", "nothing light" = "heavy". "Not too simple, not too heavy" = "medium".
+- mode: "together against the game", "team up against the game", "as one team" = "cooperative". "Head to head", \
+"against each other" = "competitive". Otherwise null.
+- child_age: "our 8-year-old" = 8. Otherwise null.
+- avoid: "no fighting"/"no combat" = "fighting". "Nothing violent" = "violence". "Nothing scary"/"nothing creepy" = \
+"horror". "No timers"/"no racing against the clock" = "timer". "Nobody knocked out"/"nobody sitting out" = \
+"elimination". Only list what the request says.
 
-STEP 2: Check every requirement for every game. Each check is FITS, BREAKS or UNKNOWN.
-- Players: fits if the number is within the card's range. If the card says "not listed", a number stated in the \
-description counts. Only the base game counts: player counts that need a separately sold expansion don't.
-- Play time: the game's LONGEST listed time must be within the limit ("30 to 60 minutes" does NOT fit "at most \
-45"). If the card says "not listed", a play time stated in the description counts. Time to learn the rules is not \
-play time.
-- Age: fits if the card's minimum age is at or below the child's age. If not listed, an age in the description \
-counts ("ages 8 and up"). "Family game" says nothing about age.
-- Cooperative: the game is cooperative if and only if its mechanics include "Cooperative Game". Otherwise it is \
-competitive (teams playing against each other are competitive).
-- Complexity, using the weight W (1 to 5), the game types, and description wording about how hard the RULES are:
-  LIGHT is YES if W <= 1.3, or the description says the rules are easy/simple, or it is a children's or party \
-game, or it is a family game with W < 2.0.
-  LIGHT is NO if W >= 4.0, or the description says the rules are complex/for experienced players, or its only \
-types are strategy/thematic/war/abstract and W >= 2.5.
-  HEAVY is YES if W >= 4.0, or the description says the rules are complex/for experienced players, or it is a \
-strategy or war game (not also family) with W >= 3.5.
-  HEAVY is NO if W <= 1.3, or the description says the rules are easy/simple, or it is a children's, party or \
-family game.
-  The extremes (W <= 1.3, W >= 4.0) beat every other clue. If clues point both ways, or none applies: UNKNOWN.
-  MEDIUM is NO if the game is light or heavy; YES if it is neither and 2.0 <= W <= 3.5; otherwise UNKNOWN.
-  Description wording counts only if it is about how hard the rules are ("lighter than many similar games"). \
-"Easy to learn, hard to master" doesn't decide. Wording about how hard it is to win, about one part or variant, \
-or about the audience ("family game") doesn't count. If the card doesn't list complexity, only description \
-wording can decide.
-- Things to avoid. A game has the feature if its card has the tag, OR the description shows the feature actually \
-happening in play. A tag always counts; the description can add a feature but never remove a tag. An empty \
-category or mechanic list means no tags, not unknown.
-  Tags: fighting = "Fighting" category. Violence = "Wargame" category or the Fighting tag. Horror = "Horror" or \
-"Zombies" category. Timer = "Real-time" category or "Real-Time" mechanic. Elimination = "Player Elimination" \
-mechanic.
-  FIGHTING: players' characters or creatures attack, battle or duel other characters or creatures. NOT fighting: \
-armies/fleets/units attacking on a map, raiding or conquering for points (those are violence), metaphors \
-("disease-fighting", "fight over resources", "battle to spread plagues"), backstory, contests merely called \
-duels or battles, penalties called attacks (Catan's pirate, thieves stealing goods), abstract captures like chess, \
-a genre label alone ("dungeon crawler").
-  VIOLENCE: the game is about war, battles between armies, raiding, pillaging, conquest or killing, or it has \
-fighting. NOT violence: penalties called attacks, metaphors, a grim backstory.
-  HORROR: the game is meant to frighten: horror creatures (vampires, zombies, werewolves, Cthulhu monsters) as the \
-threat, threatening ghosts or hauntings, being hunted, frightening gore. NOT horror: generic fantasy monsters and \
-dungeons, harmless or helpful ghosts, undead or demons as enemies in heroic or comic fantasy, a horror word only in \
-a licensed title, realistic threats, cartoon spookiness in family or children's games, one horror character among \
+JOB 2: For each game, read its DESCRIPTION (the card is checked by code).
+- features: which of the features in your avoid list the description shows actually happening when people play. \
+Only check the features in your avoid list; if avoid is empty, write []. Use these definitions:
+  fighting: the players' characters or creatures attack, battle or duel other characters or creatures. NOT \
+fighting: armies, fleets or units attacking on a map; raiding or conquering to score; metaphors ("disease-fighting", \
+"fight over resources", "battle to spread plagues"); backstory; contests only called duels or battles; a penalty \
+called an attack (a pirate or thieves stealing cards); abstract captures like chess; a genre label alone.
+  violence: the game is about war, battles between armies, raiding, pillaging, conquest or killing, or it has \
+fighting. NOT violence: a penalty called an attack, metaphors, a grim backstory.
+  horror: the game is meant to frighten: vampires, zombies, werewolves or Cthulhu monsters as the threat, \
+threatening ghosts or hauntings, being hunted, frightening gore. NOT horror: generic fantasy monsters and dungeons, \
+harmless or helpful ghosts, undead or demons as enemies in heroic or comic fantasy, a horror word only in a \
+licensed title, realistic threats, cartoon spookiness in family or children's games, one horror character among \
 many, giant monsters smashing a city, murder mysteries.
-  TIMER: racing a clock or sand timer, everyone playing at once as fast as they can, grabbing or running at the \
-same moment, timed turns. NOT a timer: a countdown track that ends the game, simultaneous action choice without \
-racing, "fast-paced", racing only as a theme, an optional timer.
-  PLAYER ELIMINATION: a player can be knocked out and must sit and watch, for the rest of the game or of a round \
-(also when the rules make it unavoidable, e.g. "last person alive wins", or "win all the cards" with 3+ players). \
-NOT elimination: losing points or pieces while still playing, a cooperative team losing together, a 2-player \
-game that ends when one is knocked out, a knocked-out player who keeps playing in another role.
-  A feature counts even if it appears only in an optional variant or one scenario. If the description contradicts \
+  timer: racing a clock or sand timer, everyone playing at once as fast as they can, grabbing or running at the \
+same moment, timed turns. NOT a timer: a countdown track that ends the game, choosing actions at the same time \
+without racing, "fast-paced", racing only as a theme, an optional timer.
+  elimination: a player can be knocked out and must sit and watch, for the rest of the game or of a round (also \
+when the rules make it unavoidable: "last person alive wins", or "win all the cards" with 3 or more players). NOT \
+elimination: losing points or pieces while still playing, a cooperative team losing together, a 2-player game that \
+ends when one player is knocked out, a knocked-out player who keeps playing in another role.
+  A feature counts even if it is only in an optional variant or one scenario. If the description contradicts \
 itself, the more detailed rule wins.
-- If a requirement can't be checked from the card or the description, it is UNKNOWN.
-
-STEP 3: Decide.
-- A game is ACCEPTABLE only if every requirement FITS. One BREAKS or one UNKNOWN makes it not acceptable.
-- Pick an acceptable game. If none is acceptable, pick null. Never pick a game with an UNKNOWN requirement: \
-declining is better than a guess.
-- In the explanation, say briefly why the game fits, or why none does, using only facts from the card and the \
-description."""
+- rules: what the description says about how hard the RULES are. "easy" if it says the rules are easy or simple, \
+or the game is lighter than similar games. "complex" if it says the rules are complex or for experienced players. \
+"none" otherwise, and also for "easy to learn, hard to master", for how hard the game is to win, for one part or \
+an optional variant, or for the audience ("family game").
+- players, minutes, age: ONLY for card fields listed under "Card fields not listed" at the end. Give the number \
+the description states for the base game (players as [min, max], minutes as the longest time, age as the minimum \
+age), or null if it doesn't state one. Time to learn the rules is not play time. Player counts that need a \
+separately sold expansion don't count. For every other game, write null."""
 
 # The answer format. Keep it, unless you also change how answer() reads the reply.
-FORMAT = """Answer with JSON only, in this form:
-{"pick": "<the game's letter, or null to decline>", "explanation": "<one or two sentences for the person>"}"""
+FORMAT = """Answer with JSON only, in this form (the values are only an example):
+{
+  "requirements": {"players": 4, "max_minutes": 60, "complexity": "light", "mode": null, "child_age": null, \
+"avoid": ["horror"]},
+  "games": {
+    "A": {"features": [], "rules": "none", "players": null, "minutes": null, "age": null},
+    "B": {"features": ["horror"], "rules": "easy", "players": null, "minutes": null, "age": null},
+    "C": {"features": [], "rules": "none", "players": [2, 6], "minutes": null, "age": null},
+    "D": {"features": [], "rules": "complex", "players": null, "minutes": null, "age": null},
+    "E": {"features": [], "rules": "none", "players": null, "minutes": null, "age": null}
+  }
+}
+Use null (no quotes) for anything missing."""
+
+
+class Requirements(BaseModel):
+    players: Optional[int] = None
+    max_minutes: Optional[int] = None
+    complexity: Optional[str] = None
+    mode: Optional[str] = None
+    child_age: Optional[int] = None
+    avoid: list[Optional[str]] = []
+
+
+class GameReading(BaseModel):
+    features: list[Optional[str]] = []
+    rules: Optional[str] = "none"
+    players: Optional[Union[list[int], int]] = None
+    minutes: Optional[Union[list[int], int]] = None
+    age: Optional[int] = None
+
+
+class Reply(BaseModel):
+    requirements: Requirements = Requirements()
+    games: dict[str, GameReading] = {}
+
+
+Verdict = Literal["fits", "breaks", "unknown"]
+
+
+def _norm(text: Optional[str]) -> str:
+    return (text or "").strip().lower()
+
+
+def _missing_fields(c: Candidate) -> list[str]:
+    card = c.card
+    return [name for name, value in (("players", card.players), ("minutes", card.minutes), ("age", card.age))
+            if value is None]
+
+
+def _missing_note(request: Request) -> str:
+    lines = [f"{c.id}: {', '.join(_missing_fields(c))}" for c in request.candidates if _missing_fields(c)]
+    return "Card fields not listed:\n" + ("\n".join(lines) if lines else "none")
+
+
+def _as_range(value) -> Optional[tuple[int, int]]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value, value
+    if len(value) == 0:
+        return None
+    return min(value), max(value)
+
+
+# Rubric section 3, complexity: each question is "yes", "no" or "unknown".
+def _light(weight: Optional[float], types: set[str], rules: str) -> str:
+    if weight is not None and weight <= 1.3:
+        return "yes"
+    if weight is not None and weight >= 4.0:
+        return "no"
+    yes = rules == "easy" or bool(types & {"children's", "party"}) or (
+        "family" in types and weight is not None and weight < 2.0)
+    no = rules == "complex" or (
+        bool(types) and types <= {"strategy", "thematic", "war", "abstract"} and weight is not None and weight >= 2.5)
+    return "unknown" if yes == no else ("yes" if yes else "no")
+
+
+def _heavy(weight: Optional[float], types: set[str], rules: str) -> str:
+    if weight is not None and weight >= 4.0:
+        return "yes"
+    if weight is not None and weight <= 1.3:
+        return "no"
+    yes = rules == "complex" or (
+        bool(types & {"strategy", "war"}) and "family" not in types and weight is not None and weight >= 3.5)
+    no = rules == "easy" or bool(types & {"children's", "party", "family"})
+    return "unknown" if yes == no else ("yes" if yes else "no")
+
+
+def _medium(weight: Optional[float], light: str, heavy: str) -> str:
+    if light == "yes" or heavy == "yes":
+        return "no"
+    if weight is not None and 2.0 <= weight <= 3.5:
+        return "yes"
+    return "unknown"
+
+
+def complexity_class(c: Candidate, rules: str) -> dict[str, str]:
+    weight = c.card.complexity.weight if c.card.complexity else None
+    types = {_norm(t) for t in c.card.types}
+    light = _light(weight, types, rules)
+    heavy = _heavy(weight, types, rules)
+    return {"light": light, "heavy": heavy, "medium": _medium(weight, light, heavy)}
+
+
+def has_tag(c: Candidate, feature: str) -> bool:
+    cats = {_norm(x) for x in c.card.categories}
+    mechs = {_norm(x) for x in c.card.mechanics}
+    if feature == "fighting":
+        return "fighting" in cats
+    if feature == "violence":
+        return bool(cats & {"wargame", "fighting"})
+    if feature == "horror":
+        return bool(cats & {"horror", "zombies"})
+    if feature == "timer":
+        return "real-time" in cats or "real-time" in mechs
+    if feature == "elimination":
+        return "player elimination" in mechs
+    return False
+
+
+def check_game(c: Candidate, req: Requirements, reading: GameReading) -> dict[str, Verdict]:
+    """Check each requirement of the request against one game."""
+    checks: dict[str, Verdict] = {}
+    card = c.card
+    if req.players:
+        rng = _as_range(card.players) or _as_range(reading.players)
+        checks["players"] = "unknown" if rng is None else ("fits" if rng[0] <= req.players <= rng[1] else "breaks")
+    if req.max_minutes:
+        rng = _as_range(card.minutes) or _as_range(reading.minutes)
+        checks["play time"] = "unknown" if rng is None else ("fits" if rng[1] <= req.max_minutes else "breaks")
+    if req.child_age:
+        age = card.age if card.age is not None else reading.age
+        checks["age"] = "unknown" if age is None else ("fits" if age <= req.child_age else "breaks")
+    level = _norm(req.complexity)
+    if level in ("light", "medium", "heavy"):
+        answer = complexity_class(c, _norm(reading.rules))[level]
+        checks["complexity"] = {"yes": "fits", "no": "breaks"}.get(answer, "unknown")
+    mode = _norm(req.mode)
+    if mode in ("cooperative", "competitive"):
+        coop = "cooperative game" in {_norm(m) for m in card.mechanics}
+        checks[mode] = "fits" if coop == (mode == "cooperative") else "breaks"
+    seen = {_norm(f) for f in reading.features}
+    for feature in {_norm(f) for f in req.avoid} & set(FEATURES):
+        # Nothing violent also rules out fighting.
+        related = {feature, "fighting"} if feature == "violence" else {feature}
+        has = any(has_tag(c, f) or f in seen for f in related)
+        checks[f"no {feature}"] = "breaks" if has else "fits"
+    return checks
+
+
+def _explain(c: Candidate, req: Requirements, checks: dict[str, Verdict]) -> str:
+    facts = []
+    card = c.card
+    if "players" in checks and card.players:
+        facts.append(f"it plays {card.players[0]} to {card.players[-1]} and you are {req.players}")
+    if "play time" in checks and card.minutes:
+        facts.append(f"it takes at most {card.minutes[-1]} minutes")
+    if "complexity" in checks:
+        facts.append(f"its rules fit your wish for a {req.complexity} game")
+    for name in checks:
+        if name.startswith("no ") or name in ("cooperative", "competitive", "age"):
+            facts.append(f"it fits '{name}'")
+    return f"{c.name} meets every requirement: " + "; ".join(facts) + "." if facts else f"{c.name} fits your request."
+
+
+def decide(request: Request, reply: Reply) -> Answer:
+    req = reply.requirements
+    reasons = []
+    for c in request.candidates:
+        reading = reply.games.get(c.id) or GameReading()
+        checks = check_game(c, req, reading)
+        if all(v == "fits" for v in checks.values()):
+            return Answer(pick=c.id, explanation=_explain(c, req, checks))
+        bad = [f"{k} ({v})" for k, v in checks.items() if v != "fits"]
+        reasons.append(f"{c.name}: {', '.join(bad)}")
+    return Answer(pick=None, explanation="None of the games surely meets every requirement. " + "; ".join(reasons) + ".")
 
 
 def answer(request: Request) -> Answer:
     if not INSTRUCTIONS.strip():
         raise NotImplementedError("Write your instructions in INSTRUCTIONS in systems/single.py first.")
-    return call_json(f"{INSTRUCTIONS}\n\n{FORMAT}\n\n{render_request(request)}", Answer)
+    prompt = f"{INSTRUCTIONS}\n\n{FORMAT}\n\n{render_request(request)}\n\n{_missing_note(request)}"
+    text = call(prompt, max_tokens=1500)
+    # One call only, so we can't ask again: a reply we can't read becomes a decline.
+    try:
+        reply = parse_json(text, Reply)
+    except (ValidationError, ValueError):
+        return Answer(pick=None, explanation="Sorry, I couldn't find a game that surely fits your request.")
+    return decide(request, reply)
