@@ -8,7 +8,7 @@ Still one model call per request.
 import re
 from typing import Literal, Optional, Union
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from p1 import Answer, Request, call, parse_json
 from p1.render import render_request
@@ -393,10 +393,11 @@ def answer(request: Request) -> Answer:
         raise NotImplementedError("Write your instructions in INSTRUCTIONS in systems/single.py first.")
     prompt = (f"{INSTRUCTIONS}\n\n{FORMAT}\n\n{render_request(request)}\n\n{_missing_note(request)}\n\n"
               f"{_difficulty_note(request)}")
-    text = call(prompt, max_tokens=1500)
-    # One call only, so we can't ask again: a reply we can't read becomes a decline.
+    # One call only, so we can't ask again: a failed call, a reply we can't read, or a bug in the checks becomes a
+    # decline, so every request still gets an answer.
     try:
+        text = call(prompt, max_tokens=1500)
         reply = parse_json(text, Reply)
-    except (ValidationError, ValueError):
+        return decide(request, reply)
+    except Exception:
         return Answer(pick=None, explanation="Sorry, I couldn't find a game that surely fits your request.")
-    return decide(request, reply)
